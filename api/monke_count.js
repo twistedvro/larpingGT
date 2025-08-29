@@ -20,8 +20,14 @@ export default async function handler(req, res) {
     return res.status(200).json({ success: true });
   } 
   else if (req.method === 'GET') {
-    // Create chart with current count + peak as overlay text
-    const currentCount = playerHistory.length ? playerHistory[playerHistory.length - 1].count : 0;
+    // Add dummy data if empty (so bot works immediately)
+    if (playerHistory.length === 0) {
+      const now = new Date();
+      playerHistory.push({ time: now, count: 1234 });
+      peakCount = 1234;
+    }
+
+    const currentCount = playerHistory[playerHistory.length - 1].count;
 
     const configuration = {
       type: 'line',
@@ -44,9 +50,7 @@ export default async function handler(req, res) {
             font: { size: 18 }
           }
         },
-        scales: {
-          y: { beginAtZero: true },
-        },
+        scales: { y: { beginAtZero: true } },
       },
     };
 
