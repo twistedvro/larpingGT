@@ -1,138 +1,60 @@
-# api/update_monke_count.py
-import json, os, time, urllib.parse
-from http.server import BaseHTTPRequestHandler
-import requests
+import { Redis } from "@upstash/redis";
 
-UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-API_KEY       = os.environ.get("MONKE_API_KEY", "")  # simple shared secret
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-# Redis keys
-ZSET_SERIES = "monke:series"     # sorted set of (score=unix_ts, member=json)
-HASH_CURR   = "monke:current"    # hash for the latest snapshot
+export default async function handler(req, res) {
+  const now = Math.floor(Date.now() / 1000);
 
-def runcmd(cmd, *args):
-    # Upstash REST (pipeline one command): returns {"result": ...}
-    payload = {"cmd": cmd, "args": list(args)}
-    r = requests.post(
-        f"{UPSTASH_URL}/pipeline",
-        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}",
-                 "Content-Type": "application/json"},
-        data=json.dumps([payload]),
-        timeout=5,
-    )
-    r.raise_for_status()
-    return r.json()[0]["result"]
+  // --- POST: from Unity client
+  if (req.method === "POST") {
+    if (
+      process.env.MONKE_API_KEY &&
+      req.headers["x-api-key"] !== process.env.MONKE_API_KEY
+    ) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
-def zadd_series(ts, item_json):
-    return runcmd("ZADD", ZSET_SERIES, "NX", ts, item_json)
+    const body = req.body;
+    let count = parseInt(body.player_count, 10);
+    if (isNaN(count)) return res.status(400).json({ error: "player_count required" });
 
-def ztrim_older_than(cutoff_ts):
-    return runcmd("ZREMRANGEBYSCORE", ZSET_SERIES, "-inf", cutoff_ts)
+    const snapshot = {
+      player_count: count,
+      room_name: body.room_name || "",
+      game_version: body.game_version || "",
+      game_name: body.game_name || "",
+      timestamp: now,
+    };
 
-def zrange_24h(from_ts):
-    return runcmd("ZRANGEBYSCORE", ZSET_SERIES, from_ts, "+inf")
+    // Store timeseries (ZADD) and trim >24h old
+    await redis.zadd("monke:series", { score: now, member: JSON.stringify({ t: now, c: count }) });
+    await redis.zremrangebyscore("monke:series", "-inf", now - 24 * 3600);
 
-def hset_current(snapshot):
-    # Flatten dict into [k1, v1, k2, v2, ...]
-    flat = []
-    for k, v in snapshot.items():
-        flat.extend([k, str(v)])
-    return runcmd("HSET", HASH_CURR, *flat)
+    // Store current snapshot (hash-like, but use JSON)
+    await redis.set("monke:current", JSON.stringify(snapshot));
 
-def hgetall_current():
-    return runcmd("HGETALL", HASH_CURR)
+    return res.json({ ok: true });
+  }
 
-def parse_form(body):
-    parsed = urllib.parse.parse_qs(body)
-    # take first value for each key
-    return {k: v[0] for k, v in parsed.items()}
+  // --- GET: return stats
+  if (req.method === "GET") {
+    const seriesRaw = await redis.zrange("monke:series", 0, -1);
+    const series = seriesRaw.map((s) => JSON.parse(s));
+    const peak = series.reduce((m, pt) => Math.max(m, pt.c), 0);
 
-def parse_body(content_type, raw):
-    if (content_type or "").startswith("application/json"):
-        return json.loads(raw or "{}")
-    # default: x-www-form-urlencoded (UnityWebRequest.Post)
-    return parse_form(raw or "")
+    const currRaw = await redis.get("monke:current");
+    const current = currRaw ? JSON.parse(currRaw) : {};
 
-def ok(self, obj):
-    data = json.dumps(obj).encode()
-    self.send_response(200)
-    self.send_header("Content-Type", "application/json")
-    self.send_header("Cache-Control", "no-store")
-    self.send_header("Content-Length", str(len(data)))
-    self.end_headers()
-    self.wfile.write(data)
+    return res.json({
+      current,
+      peak_24h: peak,
+      last_24h: series,
+    });
+  }
 
-def bad(self, code, msg):
-    data = json.dumps({"error": msg}).encode()
-    self.send_response(code)
-    self.send_header("Content-Type", "application/json")
-    self.send_header("Content-Length", str(len(data)))
-    self.end_headers()
-    self.wfile.write(data)
-
-class handler(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-API-Key")
-        self.end_headers()
-
-    def do_POST(self):
-        # simple shared-secret gate
-        if API_KEY and self.headers.get("X-API-Key") != API_KEY:
-            return bad(self, 401, "unauthorized")
-
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length).decode("utf-8") if length else ""
-        try:
-            payload = parse_body(self.headers.get("Content-Type",""), raw)
-        except Exception:
-            return bad(self, 400, "invalid body")
-
-        # expected fields from Unity
-        try:
-            count = int(payload.get("player_count"))
-        except Exception:
-            return bad(self, 400, "player_count required (int)")
-
-        now = int(time.time())
-
-        snapshot = {
-            "player_count": count,
-            "room_name": payload.get("room_name", ""),
-            "game_version": payload.get("game_version", ""),
-            "game_name": payload.get("game_name", ""),
-            "timestamp": now,
-        }
-
-        # store time-series (24h window) + latest
-        try:
-            zadd_series(now, json.dumps({"t": now, "c": count}))
-            ztrim_older_than(now - 24*3600)
-            hset_current(snapshot)
-        except Exception as e:
-            return bad(self, 500, f"storage error: {e}")
-
-        return ok(self, {"ok": True})
-
-    def do_GET(self):
-        # Read current + last 24h + peak
-        now = int(time.time())
-        from_ts = now - 24*3600
-        try:
-            series_raw = zrange_24h(from_ts)
-            # series_raw is a flat list of members (because we didn’t ask WITHSCORES)
-            series = [json.loads(s) for s in series_raw] if series_raw else []
-            peak = max((pt["c"] for pt in series), default=0)
-            # current hash to dict
-            curr = hgetall_current() or {}
-        except Exception as e:
-            return bad(self, 500, f"read error: {e}")
-
-        return ok(self, {
-            "current": curr,           # latest snapshot hash
-            "peak_24h": peak,          # integer
-            "last_24h": series         # [{t, c}, ...]
-        })
+  res.setHeader("Allow", ["GET", "POST"]);
+  res.status(405).end(`Method ${req.method} Not Allowed`);
+}
