@@ -6,7 +6,8 @@
     "start": "vercel dev"
   },
   "dependencies": {
-    "chart.js": "^4.6.0",
-    "chartjs-node-canvas": "^5.0.0"
+    "chartjs-node-canvas": "^5.0.0",
+    "chart.js": "^4.6.0"
   }
+
 }
