@@ -1,7 +1,12 @@
 {
-  "name": "monke-api",
+  "name": "monke-count-backend",
   "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "vercel dev"
+  },
   "dependencies": {
-    "@upstash/redis": "^1.31.6"
+    "chart.js": "^4.6.0",
+    "chartjs-node-canvas": "^5.0.0"
   }
 }
